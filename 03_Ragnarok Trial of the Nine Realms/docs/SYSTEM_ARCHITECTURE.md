@@ -93,11 +93,18 @@ target_sectors:
   - Wheat
   - Maize
 requested_metrics:
-  - low_exposure
-  - high_exposure
-  - net_import_shortfall
-  - value_usd
-  - volume_tonnes
+  - net_value_shortfall_pct   # canonical cell metric
+  - value_shortfall_usd       # secondary
+  - volume_shortfall           # secondary, unit preserved
+exposure_cells:                # generated at runtime, never hard-coded
+  - country: Midgard
+    sector: Wheat
+  - country: Midgard
+    sector: Maize
+  - country: Tolan
+    sector: Wheat
+  - country: Tolan
+    sector: Maize
 event_scope:            # hard retrieval scope, see section 15
   - E5
   - NONE
@@ -173,6 +180,18 @@ Heimdall is responsible for opening the case, not arguing the exposure.
 - Report damaged or empty files without crashing.
 - Re-search after Odin sends the case back.
 
+#### Event-verification rule
+
+The event and the question's premise are verified separately. A premise such as `destroyed`, `closed`, `banned`, or `permanently shut` is not inferred merely because the question contains those words.
+
+The event is `VERIFIED` only when all of the following hold:
+
+1. At least one eligible Tier 1 or Tier 2, non-retracted, case-event document published on or before the Case File as-of date asserts the event.
+2. The supporting document is not `BACKGROUND_ONLY` and is not a damaged-only evidence family.
+3. No later eligible Tier 1 or Tier 2 document corrects or retracts the asserted event or premise.
+
+If only Tier 3/4 or retracted evidence supports the event/premise, Heimdall returns `EVENT_REJECTED` with the reason and the supporting/correcting citations. A verified corridor lapse does not automatically verify a stronger premise such as port destruction.
+
 #### Forbidden behavior
 
 - Do not argue that exposure is high or low.
@@ -191,8 +210,8 @@ Every Thor claim must include:
 
 - A precise claim statement.
 - Country and sector.
-- High-side estimate or range.
-- Unit: percentage, USD, or tonnes.
+- Exactly one `CELL_ESTIMATE` claim per Case File exposure cell.
+- A high-side low/high estimate in the canonical `net_value_shortfall_pct` metric.
 - One or more Runemark document or trade-row citations.
 - Assumptions.
 - Confidence.
@@ -221,8 +240,8 @@ Every Loki claim must include:
 
 - A precise claim statement.
 - Country and sector.
-- Low-side estimate or range.
-- Unit: percentage, USD, or tonnes.
+- Exactly one `CELL_ESTIMATE` claim per Case File exposure cell.
+- A low-side low/high estimate in the canonical `net_value_shortfall_pct` metric.
 - One or more Runemark document or trade-row citations.
 - A concrete substitution or mitigation mechanism.
 - Assumptions.
@@ -436,6 +455,9 @@ The current pack is intentionally adversarial. These are not edge cases; they ar
 | Premature renewal report | `ORV-0043` | Keep as historical evidence, but do not treat as final truth after the correction |
 | Regional confirmation of an unconfirmed renewal | `ORV-0015` | Mark as unconfirmed and contradicted |
 | Official correction | `ORV-0013` | Create a correction relation and downgrade the original report |
+| Earlier renewal expectation | `ORV-0003` | Treat as superseded/forecast evidence after later official expiry evidence; never establish renewal |
+| Continuity analyst view | `ORV-0049` | Treat as a dated Tier 3 view with assumptions, not as an event fact |
+| Interested-party statement | `ORV-0004`, `ORV-0021` | Establish only issuer-specific operations/figures; do not establish whole-market exposure alone |
 | Official expiry notice | `ORV-0016` | Use as primary event verification evidence |
 | Official strike notice | `ORV-0032` | Use to verify operational disruption |
 | Social rumor | `ORV-0010` | Do not establish destruction of the port |
@@ -537,7 +559,8 @@ flowchart TB
     BUDGET -->|case cap reached| SUFF
     SUFF -->|insufficient, run 2 allowed| H
     SUFF -->|sufficient| BRIEF[Final briefing<br/>from rulings only]
-    SUFF -->|run 2 still insufficient or limit reached| INCOMPLETE[Incomplete briefing<br/>per-cell INSUFFICIENT_EVIDENCE]
+    SUFF -->|gaps searched, none found: cell flagged| BRIEF
+    SUFF -->|stopped early on budget or limits| INCOMPLETE[Incomplete briefing<br/>labelled INCOMPLETE]
     ODIN --> BRIEF
     ODIN --> EXP[Exposure table]
 
@@ -805,6 +828,10 @@ trial-nine-realms/
 │   ├── run_case.py
 │   └── replay_case.py
 │
+├── tools/                    # zero-LLM ingestion and local analysis utilities
+│   ├── extract.py
+│   └── analyze.py
+│
 ├── tests/
 │   ├── unit/
 │   ├── integration/
@@ -871,7 +898,7 @@ Each document should be normalized into one JSON record:
     "bytes": 12345
   },
   "extraction": {
-    "status": "complete",
+    "status": "OK",
     "decoder": "pdf-text",
     "confidence": 0.99,
     "errors": []
@@ -903,14 +930,15 @@ Each document should be normalized into one JSON record:
   "native_row_number": null,
   "origin": "Orvan",
   "destination": "Midgard",
-  "sector": "Maize",
+  "declared_sector": "Wheat",
+  "content_sector": "Maize",
   "month": "2026-10",
-  "value_usd": 62100000,
-  "volume_tonnes": 146000,
-  "unit": {
-    "value": "USD",
-    "volume": "tonnes"
-  },
+  "value_amount": 62100000,
+  "value_currency": "USD",
+  "value_scale": "M",
+  "volume_amount": 146000,
+  "volume_unit": "tonnes",
+  "raw_sentence": "In October 2026, the value was USD 62.1M and the volume was 146,000 tonnes.",
   "parse_status": "valid",
   "citation": {
     "doc_id": "ORV-0030",
@@ -951,9 +979,10 @@ Each document should be normalized into one JSON record:
   "agent": "thor",
   "claim_text": "The end of the corridor produced a substantial net wheat shortfall for Tolan because Vanir replacement was smaller than the lost Orvan sea volume.",
   "claim_kind": "INFERENCE",
+  "claim_type": "CELL_ESTIMATE",
   "country": "Tolan",
   "sector": "Wheat",
-  "metric": "net_import_shortfall_percent",
+  "metric": "net_value_shortfall_pct",
   "estimate": {
     "low": 45.0,
     "high": 65.0,
@@ -965,9 +994,9 @@ Each document should be normalized into one JSON record:
     "Rail does not fully replace lost sea capacity"
   ],
   "evidence_refs": [
-    {"doc_id": "ORV-0046", "span_id": "ORV-0046:P4"},
-    {"doc_id": "ORV-0044", "span_id": "ORV-0044:P6"},
-    {"doc_id": "ORV-0050", "span_id": "ORV-0050:P5"}
+    {"doc_id": "ORV-0046", "paragraph": "P4", "published_at": "2027-01-20T10:05:00"},
+    {"doc_id": "ORV-0044", "paragraph": "P6", "published_at": "2027-01-22T10:50:00"},
+    {"doc_id": "ORV-0050", "paragraph": "P5", "published_at": "2026-11-20T11:25:00"}
   ],
   "confidence": 0.78,
   "status": "submitted"
@@ -1178,6 +1207,17 @@ The manifest is the source of document identity. For each entry:
 5. Compare manifest metadata with the document's own header.
 6. Record any mismatch without silently overwriting either version.
 
+Normalize both supported manifest schemas on load:
+
+- Upper-case keys win over lowercase duplicates.
+- Coerce `RELIABILITY` to an integer tier.
+- Infer `FORMAT` from the file extension when it is absent.
+- Compare duplicate lowercase/uppercase fields and flag `METADATA_CONFLICT` when values disagree.
+- Tolerate missing optional fields without raising a `KeyError`.
+- Preserve the raw manifest entry alongside the normalized record.
+
+Live packs may use either the ATL/WLD-style schema or the ORV-style schema.
+
 ### 14.3 Text extraction rules
 
 #### TXT
@@ -1188,8 +1228,10 @@ For each section, try decoders in this order:
 
 1. UTF-8 with BOM detection.
 2. UTF-16 LE/BE with BOM detection.
-3. UTF-8 replacement decoding for damaged input.
-4. A final best-effort decode with an error flag.
+3. If at least 20% of bytes are NUL, try BOM-less UTF-16 LE and BE and choose the candidate with the most printable ASCII.
+4. UTF-8 replacement decoding for damaged input.
+5. CP1252 fallback, flagged as `MALFORMED_ENCODING`.
+6. A final best-effort decode with an error flag.
 
 For `ORV-0007`, the expected path is a UTF-8-compatible metadata header followed by a UTF-16 little-endian body with a BOM. This is a general mixed-encoding recovery rule, not a filename-specific exception.
 
@@ -1209,6 +1251,8 @@ If the PDF is image-only, mark it `OCR_REQUIRED` rather than silently producing 
 #### DOCX
 
 Use `python-docx` for normal extraction. If the package cannot be opened, inspect `word/document.xml` directly when possible and mark the result as `XML_FALLBACK`.
+
+Every normalized document exposes one top-level extraction status: `OK`, `EMPTY`, `TRUNCATED`, `RECODED`, or `FAILED`. A `RECODED` document may still be fully usable; the status records that a non-default or section-specific decoder was required.
 
 ### 14.4 Quality flags
 
@@ -1232,6 +1276,7 @@ TRADE_ROW_BAD_NUMBER
 TRADE_ROW_REPEATED_VALUES
 TRADE_TABLE_TRUNCATED
 TRADE_TABLE_MISSING_MONTH
+TRADE_TABLE_UNPARSED
 CONTENT_HASH_DUPLICATE
 EVIDENCE_FAMILY_DUPLICATE
 ```
@@ -1268,14 +1313,18 @@ Two layouts are supported. Both produce the trade-row JSON in section 12.3.
 ```
 
 1. Extract text, then normalize all whitespace (including newlines) to single spaces before matching. PDF extraction wraps lines mid-phrase, e.g. `ORV-0046` P4 splits `43,000` / `tonnes`.
-2. Split on `[Pn]` labels, then match `In <Month> <Year>, the value was USD <x>M and the volume was <n> tonnes`.
-3. Key each row on `(source_doc_id, month, year)`, never on position. E5 notes list 2026 rows (P2-P7) before 2025 rows (P8-P13).
-4. Route and sector come from the `Route:` paragraph and the title, not from the `SECTOR` header (see the sector trap policy in section 15).
-5. Non-row paragraphs (route line, closing commentary such as P14) are kept as ordinary evidence spans.
+2. Split on `[Pn]` labels, then match the unit-agnostic grammar:
+   `In <Month> <Year>, the value was <CUR> <number><scale?> and the volume was <number> <unit words>.`
+3. Normalize scales `{K, M, B, bn}` to an absolute numeric amount, while preserving `value_currency`, `value_scale`, `volume_unit`, and the raw sentence. Currency symbols and alphabetic currency codes are accepted.
+4. Treat the volume unit as an arbitrary word sequence up to the sentence boundary. Do not assume tonnes, kilograms, MT, units, MMBtu, or an index are interchangeable.
+5. Key each row on `(source_doc_id, month, year)`, never on position. E5 notes list 2026 rows (P2-P7) before 2025 rows (P8-P13).
+6. Route and content sector come from the `Route:` paragraph, title, and body, not only from the `SECTOR` header (see the sector trap policy in section 15).
+7. Non-row paragraphs (route line, closing commentary such as P14) are kept as ordinary evidence spans.
+8. A sentence that matches neither the prose grammar nor a fixed-table row becomes `TRADE_ROW_INVALID` and remains searchable/auditable. It is never silently dropped, guessed, converted using `ATL-0007` indicative prices, or used in arithmetic.
 
-**PS fixed-layout TXT tables.** Header block (table ID, country pair, sector, unit, period, event ID), one column-name line, then one row per month with the row number in the first column. Keep the native row number as `native_row_number` for display.
+**PS fixed-layout TXT tables.** Read `key: value` header lines until the first column line containing at least three delimiter-separated tokens. Detect the delimiter from pipe, tab, comma, or two-or-more spaces. Map columns case-insensitively by names such as row, month/period, value, volume, and unit. Keep the source table ID and native row number as internal anchors. If the table cannot be parsed, flag `TRADE_TABLE_UNPARSED`, preserve raw text for search, and continue without using its rows silently.
 
-**Citation.** A trade row is always cited as `[DOC_ID, P#, timestamp]` using the paragraph (or source line) that holds it. Internal keys are never emitted as citations.
+**Citation.** External citations use only `[DOC_ID, P#, timestamp]`. For prose rows, cite the `[Pn]` paragraph holding the sentence. For a fixed-layout row, retain its native table ID and row number internally for click-through, but cite the containing `[Pn]` paragraph/source span if one exists. Do not introduce `R<n>` or fabricated `TABLE:` identifiers. The unresolved case where a future fixed table has no paragraph/source span is recorded as an open citation decision in `docs/FIX_PASS5.md`.
 
 **Damaged-table handling.** Flag, never silently use, never silently drop:
 
@@ -1331,6 +1380,8 @@ Every production search applies at least two metadata filters (PS acceptance cri
 
 The event scope keeps background and reference documents (`EVENT_ID: NONE`, e.g. `ATL-0010` Tolan import profile, `ATL-0012` outlet tiers, `ATL-0014` routes) visible. Documents tagged with a different, non-NONE event stay excluded.
 
+`EVENT_ID: NONE` records are always tagged `BACKGROUND_ONLY`. They may support reference facts such as country profiles, route descriptions, outlet tiers, units, and general firm information. They may not establish an event-impact claim or numeric exposure cell on their own. Every exposure cell must cite at least one eligible document whose `EVENT_ID` equals the Case File event. The deterministic rejection rules in section 21 enforce this boundary.
+
 Optional additional filters:
 
 ```text
@@ -1374,6 +1425,30 @@ Search behavior:
 5. Require the agent or validator to resolve the conflict before using numeric evidence.
 
 This prevents the best maize data from disappearing simply because a metadata field is wrong.
+
+### Source rules
+
+These rules are deterministic and apply before Odin classifies a claim:
+
+1. A claim supported only by a Tier 4 source cannot be `ESTABLISHED`.
+2. A `company_statement` establishes facts only about the issuing company's own operations, statements, or reported figures; it does not independently establish a whole-market or competitor-wide conclusion.
+3. A later eligible Tier 1 or Tier 2 document on the same subject supersedes an earlier conflicting report. The source graph must represent that relation; for E5, the official expiry notice supersedes earlier renewal expectations such as `ORV-0003` and unconfirmed renewal reports.
+4. `ESTABLISHED` requires at least one eligible Tier 1–2 evidence family or at least two independent eligible Tier 3 evidence families.
+5. Background-only, post-as-of, invalid-citation, and damaged-only support cannot establish an exposure cell.
+
+The trap registry must include the interested-party and superseded-source cases, including the company statements represented by `ORV-0004` and `ORV-0021`, the earlier forecast `ORV-0003`, and the analyst continuity view `ORV-0049`. These IDs are corpus examples for tests and documentation, not hard-coded retrieval rules.
+
+### Deterministic pre-ruling rejection
+
+Before Odin's model call, the runtime rejects a claim when all of its support is:
+
+- Tier 4.
+- `BACKGROUND_ONLY`.
+- Published after the Case File as-of date.
+- Invalid or unresolved citation targets.
+- A damaged-only evidence family.
+
+The rejection is recorded as an ordinary Odin ruling with `decision: REJECTED`, the failed validation reason, and the rejected evidence references. Thor and Loki are instructed to `CONCEDE` or `QUALIFY` when a later eligible Tier 1–2 source contradicts their claim; a deterministic check still prevents unsupported acceptance even if an agent fails to concede.
 
 ### Result ranking
 
@@ -1525,11 +1600,11 @@ ROUND_2_STARTED
 ODIN_RULING
           ↓
 SUFFICIENCY_CHECK
-  ├── SUFFICIENT → BRIEFING_GENERATION → COMPLETE
-  └── INSUFFICIENT → RESEARCH_REQUESTED
+   ├── SUFFICIENT → BRIEFING_GENERATION → COMPLETE
+   └── INSUFFICIENT → RESEARCH_REQUESTED
           ↓
      RUN_COUNTER_CHECK
-     ├── max_runs reached → INCOMPLETE_NO_NEW_EVIDENCE → INCOMPLETE_BRIEFING
+      ├── max_runs reached → INCOMPLETE_NO_NEW_EVIDENCE → INCOMPLETE_BRIEFING
      └── run 2 allowed
           ↓
      BUDGET_CHECK
@@ -1546,7 +1621,8 @@ ODIN_FINAL_RULING
   ↓
 FINAL_SUFFICIENCY_CHECK
   ├── SUFFICIENT → BRIEFING_GENERATION → COMPLETE
-  └── STILL_INSUFFICIENT → INCOMPLETE_NO_NEW_EVIDENCE → INCOMPLETE_BRIEFING
+   ├── GAPS_SEARCHED_NONE_FOUND → BRIEFING_GENERATION → INCOMPLETE_BRIEFING
+   └── STILL_INSUFFICIENT → INCOMPLETE_NO_NEW_EVIDENCE → INCOMPLETE_BRIEFING
 ```
 
 `INCOMPLETE_BRIEFING`: Odin still publishes a briefing from his rulings, but it is labelled `INCOMPLETE` in the header, every unresolved country/sector cell is `INSUFFICIENT_EVIDENCE` with `low: null` and `high: null` (section 21), and the run record stores `new_evidence_found_in_run_2: true|false`. The system never reports `COMPLETE` for such a case.
@@ -1573,14 +1649,28 @@ max_total_searches_per_case: 32
 max_model_retries_per_call: 2
 max_tool_retries_per_call: 2
 max_wall_clock_seconds: 900
-max_claims_per_side_per_round: 12
+max_tool_calls_per_agent_step: 6
+max_model_turns_per_agent_step: 4
+max_claims_per_side_per_round: 6
 max_output_tokens_per_call: 1500     # per-call sanity limit only, not a budget
 project_cap_usd: 4.00                # whole project, persisted in the ledger across cases
 final_round_reserve_usd: 2.50        # untouchable during development
 per_case_cap_usd: 0.50               # development; 5 final-round events x 0.50 = the reserve
+odin_briefing_reserve_usd: 0.10       # reserved at case start for Odin's final ruling/briefing
+models:
+  heimdall: claude-haiku-5-5
+  thor: claude-haiku-5-5
+  loki: claude-haiku-5-5
+  odin: claude-sonnet-5-5
+agent_effort:
+  heimdall: low
+  thor: low
+  loki: low
 ```
 
-The USD ledger is the single binding limit. It covers every billable model call: all runs, all four agents, and retries. Retrieval and embeddings are local and never billable.
+The single Anthropic key covers development and runtime. The USD ledger is the single binding limit: it covers every billable model call, all runs, all four agents, retries, and the Odin reserve. `$2.50` is reserved for the final round and is untouchable during development. All listed model prices are `unverified assumption, confirm with user` until the user confirms the current provider pricing.
+
+At case start, the guard reserves `odin_briefing_reserve_usd: 0.10` exclusively for Odin's final ruling and briefing. If the reserve is unavailable, the runtime renders a deterministic template briefing from the ruling ledger without another model call; it never spends the reserve on retrieval or advocacy.
 
 The guard is an in-process counter behind a lock, backed by the JSON ledger (section 12.9). Before each billable call the runtime, never an agent:
 
@@ -1802,12 +1892,16 @@ net_gap = gross_gap
 Maintain separate calculations:
 
 ```text
-volume_shortfall_tonnes
-value_shortfall_usd
-percentage_shortfall
+net_value_shortfall_pct   # canonical cell metric
+value_shortfall_usd       # secondary; currency preserved
+volume_shortfall          # secondary; source unit preserved
 ```
 
 Do not infer value loss from volume loss without stating the price assumption. The corpus explicitly warns that prices, freight, and insurance can cushion or amplify the commercial result.
+
+`net_value_shortfall_pct` is the net shortfall in trade value against the route-level baseline over the post-event months, expressed as a percentage. Thor and Loki each submit exactly one `CELL_ESTIMATE` claim per Case File exposure cell; those claims are the two advocacy ranges. Supporting claims carry no exposure range of their own.
+
+Any price or rate used in a calculation is an `unverified assumption, confirm with user` unless it appears in an eligible source span for the same calculation. Never use `ATL-0007` indicative prices to derive a missing trade value from volume.
 
 ### Thor range
 
@@ -1835,7 +1929,13 @@ Odin should construct the final range from accepted and qualified evidence. It m
 
 ### Evidence coverage and unknown values
 
-Before calculating a final cell, Odin evaluates whether the requested country/sector has enough eligible evidence for a defensible numeric range.
+Before calculating a final cell, Odin evaluates whether the requested country/sector has enough eligible evidence for a defensible numeric range. The sufficiency check returns `INSUFFICIENT` when any Case File cell:
+
+1. Has no direct origin-to-destination flow for the event origin.
+2. Rests on only one evidence family.
+3. Contains a `CONTESTED` claim whose conflict has no eligible Tier 1–2 resolution.
+
+Each gap includes at least two targeted queries and identifies the missing direct flow, substitute flow, contract/delay evidence, or source resolution.
 
 For the current E5 pack, Heimdall should explicitly test:
 
@@ -1871,9 +1971,9 @@ The Odin calculation record should include:
   "country": "Midgard",
   "sector": "Wheat",
   "sector_basis": "content_route_text",
-  "metric": "value_shortfall_usd",
-  "low": 10000000,
-  "high": 35000000,
+  "metric": "net_value_shortfall_pct",
+  "low": 20.0,
+  "high": 45.0,
   "baseline_refs": ["ORV-0009"],
   "substitute_refs": ["ORV-0027", "ORV-0050"],
   "contract_refs": [],
@@ -2080,14 +2180,15 @@ Each claim card shows:
 
 ### Page 4 — Exposure table
 
-Rows:
+Rows are generated at runtime from the Case File, in question order:
 
 ```text
-Midgard / Wheat
-Midgard / Maize
-Tolan / Wheat
-Tolan / Maize
+for country in case_file.target_countries:
+    for sector in case_file.target_sectors:
+        render country / sector
 ```
+
+Never hard-code countries or sectors in the dashboard. For E5 this produces the four cells Midgard/Tolan × Wheat/Maize; a live pack produces whatever cells the Case File derives from the question.
 
 Columns:
 
@@ -2353,7 +2454,7 @@ docker-compose.yml        # optional extra
 - Live feed is visible.
 - Trial board shows both sides.
 - Rulings are visible.
-- Exposure table has all four requested country/sector rows.
+- Exposure table has one row per Case File exposure cell.
 - Citations open source material.
 - Briefing includes outlook and assumptions.
 - Saved logs replay one complete two-run case.
