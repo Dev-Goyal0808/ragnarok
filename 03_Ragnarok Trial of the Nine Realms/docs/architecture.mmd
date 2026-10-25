@@ -1,0 +1,43 @@
+flowchart TB
+    USER[User question] --> API[FastAPI Case API]
+    API --> RT[Deterministic Trial Runtime]
+
+    RT --> ING[Ingestion and Validation]
+    ING --> MAN[Manifest + SHA-256]
+    ING --> EXT[TXT / PDF / DOCX extraction]
+    ING --> TRADE[Trade parser]
+    ING --> QUAR[Quarantine + quality flags]
+
+    EXT --> INDEX[Hybrid search index]
+    TRADE --> INDEX
+    MAN --> INDEX
+
+    INDEX --> H[Heimdall\nCase builder + verifier]
+    INDEX --> THOR[Thor\nHigh exposure]
+    INDEX --> LOKI[Loki\nLimited exposure]
+    INDEX --> ODIN[Odin\nJudge]
+
+    H --> CASE[Shared Case File]
+    CASE --> THOR
+    CASE --> LOKI
+    THOR --> CLAIMS[Claim ledger]
+    LOKI --> CLAIMS
+    CLAIMS --> CROSS[Cross-examination]
+    CROSS --> RULINGS[Odin rulings]
+    RULINGS --> ODIN
+    ODIN --> SUFF[Evidence sufficiency]
+    SUFF -->|insufficient| H
+    ODIN --> BRIEF[Final briefing]
+    ODIN --> EXP[Exposure table]
+
+    H --> HM[Heimdall private memory]
+    THOR --> TM[Thor private memory]
+    LOKI --> LM[Loki private memory]
+    ODIN --> OM[Odin private memory]
+
+    RT --> TRACE[Append-only JSONL trace]
+    TRACE --> UI[Dashboard + replay]
+    BRIEF --> UI
+    EXP --> UI
+    INDEX --> SOURCE[Source and trade-row viewer]
+    UI --> SOURCE
