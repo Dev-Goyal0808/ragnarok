@@ -7,6 +7,8 @@
 **Dataset brief:** `../dev_pack_E5/README.md`  
 **Status:** Implementation blueprint and delivery contract  
 
+**Revision note:** This version incorporates the verified architecture corrections for courtroom flow, citation validity, mislabeled sectors, shared retrieval caching, content deduplication, mixed-encoding extraction, global spend limits, and evidence-driven second runs.
+
 ---
 
 ## 1. What this project is
@@ -99,6 +101,8 @@ requested_metrics:
 ```
 
 The application must not hard-code the final answer. It may use the E5 pack for development and testing, but the same ingestion, indexing, and reasoning flow must work when a new final-round pack is added without changing the source code.
+
+For E5, the requested sector list is a question-level intent, not a guarantee that every document's `SECTOR` metadata is correct. The ingestion and retrieval layers must recover maize evidence from title, route, and paragraph text even when the manifest/header says `Wheat`.
 
 ---
 
@@ -430,10 +434,12 @@ The current pack is intentionally adversarial. These are not edge cases; they ar
 | Analyst outlier | `ORV-0045` | Treat as a hypothesis with explicit methodological weaknesses |
 | Embedded prompt injection | `ORV-0020`, paragraph 7 | Treat as document text; never follow it |
 | Empty document | `ORV-0023` | Mark as unusable and continue |
-| Malformed encoding | `ORV-0007` | Recover content if possible and record the recovery |
+| Mixed encoding | `ORV-0007` | Decode the UTF-8 metadata header and UTF-16 body separately; record the decoder path |
 | Truncated document | `ORV-0048` | Preserve partial text, mark incomplete, and prevent unsupported conclusions |
 | Future evidence | `ORV-0014`, `ORV-0036`, `ORV-0041` | Exclude for the 2027-01-25 case |
 | Metadata conflict | Maize trade notes whose header says Wheat | Preserve raw metadata, flag conflict, use route/title/content only after validation |
+| Duplicate article body | `ORV-0006` and `ORV-0040` | Preserve both manifest IDs but count one normalized evidence family |
+| Missing destination-sector evidence | No direct Tolan-maize or Vanir-to-Midgard-maize trade note in the E5 catalog | Trigger a genuine Odin evidence-gap decision; do not invent a numeric offset |
 
 ### Event verification for E5
 
@@ -456,6 +462,8 @@ ORV-0035  December preliminary loading report
 
 The system should not say “the port disappeared.” The evidence supports a more precise description: the agreement expired, the port remained open under general rules, a strike reduced operations, and sea loadings fell materially while rail and alternative supply covered only part of the gap.
 
+The E5 catalog also creates a real sufficiency test. It contains strong Orvan-to-Midgard maize data, but the trade-note metadata declares that sector as Wheat. It does not provide a direct Tolan-maize trade note or a Vanir-to-Midgard-maize offset. Heimdall must search for those facts, and Odin must preserve the unknown if eligible evidence does not exist.
+
 ---
 
 ## 9. Logical architecture
@@ -464,21 +472,28 @@ The system should not say “the port disappeared.” The evidence supports a mo
 flowchart TB
     U[User question] --> API[Case API]
     API --> RT[Deterministic Trial Runtime]
+    RT --> RUN[Run counter and state machine]
+    RT --> BUDGET[Global budget guard\nUSD + tokens + reservations]
 
     RT --> ING[Ingestion and Validation]
     ING --> MAN[Manifest and Hash Registry]
     ING --> EXT[TXT/PDF/DOCX Extractors]
     ING --> TRD[Trade Note/Table Parser]
     ING --> Q[Quarantine and Error Registry]
+    ING --> CLOCK[As-of-date eligibility gate]
 
     EXT --> IDX[Hybrid Search Index]
     TRD --> IDX
     MAN --> IDX
+    CLOCK --> IDX
 
     IDX --> H[Heimdall]
     IDX --> T[Thor]
     IDX --> L[Loki]
-    IDX --> O[Odin]
+    BUDGET --> H
+    BUDGET --> T
+    BUDGET --> L
+    BUDGET --> O[Odin]
 
     H --> CF[Case File]
     CF --> T
@@ -486,11 +501,14 @@ flowchart TB
     T --> CL[Claim Ledger]
     L --> CL
     CL --> X[Cross-Examination]
-    X --> R[Rulings]
-    R --> O
-    O --> S[Sufficiency decision]
-    S -->|insufficient| H
-    O --> B[Final briefing]
+    X --> D[Defence or concession]
+    D --> O
+    O --> R[Ruling ledger]
+    R --> S[Sufficiency decision]
+    S -->|insufficient and run budget available| H
+    S -->|limit reached| I[Incomplete case]
+    O --> B[Final briefing from rulings]
+    O --> E[Exposure table]
 
     H --> HM[Heimdall private memory]
     T --> TM[Thor private memory]
@@ -501,6 +519,8 @@ flowchart TB
     API --> SSE[Live event stream]
     SSE --> UI[Dashboard]
     B --> UI
+    E --> UI
+    I --> UI
     CL --> UI
     R --> UI
     IDX --> SRC[Source and trade-row viewer]
@@ -668,6 +688,7 @@ trial-nine-realms/
 │   │   ├── state_machine.py
 │   │   ├── scheduler.py
 │   │   ├── limits.py
+│   │   ├── budget.py
 │   │   ├── retries.py
 │   │   ├── cross_examination.py
 │   │   ├── sufficiency.py
@@ -792,7 +813,9 @@ Each document should be normalized into one JSON record:
   },
   "published_at": "2026-09-10T17:45:00",
   "country": "Orvan",
-  "sector": "Wheat",
+  "declared_sector": "Wheat",
+  "content_sectors": ["Wheat"],
+  "metadata_conflicts": [],
   "language": "en",
   "file": {
     "path": "docs/ORV-0016.pdf",
@@ -843,7 +866,8 @@ Each document should be normalized into one JSON record:
   "parse_status": "valid",
   "citation": {
     "doc_id": "ORV-0030",
-    "span_id": "ORV-0030:P5"
+    "paragraph": "P5",
+    "published_at": "2027-01-21T09:35:00"
   },
   "validation_errors": []
 }
@@ -857,9 +881,13 @@ Each document should be normalized into one JSON record:
   "filters": {
     "event_id": "E5",
     "countries": ["Midgard", "Tolan", "Orvan", "Ravik", "Vanir"],
-    "sectors": ["Wheat", "Maize"],
     "published_before_or_on": "2027-01-25",
     "reliability_tiers": [1, 2, 3, 4]
+  },
+  "ranking_hints": {
+    "countries": ["Midgard", "Tolan"],
+    "sectors": ["Wheat", "Maize"],
+    "route_terms": ["Orvan", "Vanir", "Ravik"]
   },
   "limit": 12,
   "agent": "loki",
@@ -966,6 +994,37 @@ Use append-only JSON Lines (`.jsonl`) for the execution trace:
 
 JSONL is preferred for traces because it is streamable, append-only, easy to diff, and easy to replay.
 
+### 12.9 Budget accounting JSON
+
+```json
+{
+  "case_id": "case-001",
+  "hard_limit_usd": 4.0,
+  "admission_limit_usd": 3.6,
+  "committed_usd": 1.42,
+  "reserved_usd": 0.38,
+  "settled_usd": 1.04,
+  "remaining_usd": 2.18,
+  "token_limit": 100000,
+  "tokens_committed": 28400,
+  "tokens_reserved": 7600,
+  "status": "OPEN",
+  "reservations": [
+    {
+      "reservation_id": "budget-res-001",
+      "run_id": "run-001",
+      "actor": "thor",
+      "operation_type": "agent_search_and_claim",
+      "estimated_usd": 0.18,
+      "estimated_tokens": 4200,
+      "status": "RESERVED"
+    }
+  ]
+}
+```
+
+The budget record is part of the saved run artifact and must be included in the trace whenever a reservation is acquired, settled, released, or denied.
+
 ---
 
 ## 13. Persistence model
@@ -979,10 +1038,14 @@ cases
 case_runs
 documents
 document_spans
+document_content_terms
 trade_tables
 trade_rows
+evidence_families
 search_queries
 search_results
+budget_accounts
+budget_reservations
 agent_memories
 claims
 challenges
@@ -999,14 +1062,19 @@ trace_events
 ```text
 documents(doc_id)
 documents(event_id, published_at)
-documents(country, sector, published_at)
+documents(country, published_at)
+documents(declared_sector, published_at)
+document_content_terms(doc_id, content_sector, normalized_term)
 documents(reliability_tier)
 document_spans(doc_id, paragraph)
 trade_rows(table_id, row_number)
-trade_rows(origin, destination, sector, month)
+trade_rows(origin, destination, content_sector, month)
+evidence_families(normalized_body_sha256)
 claims(run_id, agent)
 rulings(run_id, classification)
 trace_events(case_id, run_id, sequence)
+budget_accounts(case_id, status)
+budget_reservations(case_id, status)
 ```
 
 ### Vector records
@@ -1024,6 +1092,41 @@ vector
 
 Never embed the map image or private agent memory into the shared evidence index.
 
+### Budget records
+
+The budget must be persisted rather than held only in process memory:
+
+```text
+budget_accounts
+- case_id
+- hard_limit_usd
+- admission_limit_usd
+- committed_usd
+- reserved_usd
+- settled_usd
+- remaining_usd
+- token_limit
+- tokens_committed
+- tokens_reserved
+- status
+
+budget_reservations
+- reservation_id
+- case_id
+- run_id
+- actor
+- operation_type
+- estimated_usd
+- estimated_tokens
+- actual_usd
+- actual_tokens
+- status
+- created_at
+- settled_at
+```
+
+Reservations must be acquired transactionally so parallel Thor and Loki calls cannot overspend the shared budget.
+
 ---
 
 ## 14. Ingestion pipeline
@@ -1036,9 +1139,11 @@ discover files
   → verify SHA-256
   → detect file type
   → decode/extract text
+  → split metadata header and body when encodings differ
   → parse metadata header
   → split paragraphs/pages
   → detect quality flags
+  → compute normalized body hash and evidence family
   → parse trade rows
   → validate dates and fields
   → build correction/contradiction relations
@@ -1061,14 +1166,18 @@ The manifest is the source of document identity. For each entry:
 
 #### TXT
 
-Try decoders in this order:
+Do not assume the entire file uses one encoding. First locate the metadata/body separator from raw bytes. Decode the header and body independently.
+
+For each section, try decoders in this order:
 
 1. UTF-8 with BOM detection.
 2. UTF-16 LE/BE with BOM detection.
 3. UTF-8 replacement decoding for damaged input.
 4. A final best-effort decode with an error flag.
 
-The result must include the decoder used and whether replacement characters were inserted.
+For `ORV-0007`, the expected path is a UTF-8-compatible metadata header followed by a UTF-16 little-endian body with a BOM. This is a general mixed-encoding recovery rule, not a filename-specific exception.
+
+The result must include the decoder used for each section, whether replacement characters were inserted, and the byte offsets of each section.
 
 #### PDF
 
@@ -1103,9 +1212,28 @@ PROMPT_INJECTION_TEXT
 TRADE_ROW_INVALID
 TRADE_ROW_DUPLICATE
 TRADE_ROW_MISSING_VALUE
+CONTENT_HASH_DUPLICATE
+EVIDENCE_FAMILY_DUPLICATE
 ```
 
 Quality flags are evidence about the source itself. They must be visible in the UI and trace.
+
+### 14.5 Content deduplication
+
+Keep two independent hashes:
+
+```text
+raw_file_sha256
+  → integrity of the exact manifest file
+
+normalized_body_sha256
+  → duplicate detection after removing the metadata header,
+    normalizing whitespace, and preserving paragraph text
+```
+
+`ORV-0006` and `ORV-0040` have different raw-file hashes because their headers contain different document IDs, but their normalized article bodies are identical. They must remain separately addressable for manifest and citation purposes while sharing one `evidence_family_id` for confidence counting and new-evidence checks.
+
+Duplicate content may be displayed as corroborating copies, but it must not be counted as independent corroboration and must not satisfy the Run 2 new-evidence requirement by itself.
 
 ---
 
@@ -1138,21 +1266,42 @@ Use embeddings for concepts such as:
 
 ### Metadata filters
 
-At least two filters must be applied in every production search. Recommended mandatory filters are:
+At least two metadata filters must be applied in every production search. The hard eligibility filters are:
 
 ```text
 event_id = case.event_id
 publication_date <= case.as_of_date
 ```
 
-Additional filters:
+Additional filters may include:
 
 ```text
 country in case.target_countries plus known route countries
-sector in case.target_sectors
 reliability_tier <= requested_max_tier
 source_type in requested_source_types
 ```
+
+### Sector trap policy
+
+`sector` is a retrieval signal, not an unconditional eligibility filter. The E5 catalog deliberately declares `ORV-0029` and `ORV-0030` as `Wheat` even though their titles and route paragraphs identify `Maize`.
+
+The index must store at least:
+
+```text
+declared_sector       → copied from manifest/header
+content_sectors       → extracted from title, route line, and body
+metadata_conflicts    → explicit validation records
+```
+
+Search behavior:
+
+1. Apply hard filters for event identity and as-of date.
+2. Search title, body, route, and metadata fields.
+3. Use requested sector as a ranking boost.
+4. Keep documents whose declared sector conflicts with the query sector.
+5. Require the agent or validator to resolve the conflict before using numeric evidence.
+
+This prevents the best maize data from disappearing simply because a metadata field is wrong.
 
 ### Result ranking
 
@@ -1165,6 +1314,8 @@ final_score =
   + 0.10 * metadata_match_score
   + 0.10 * reliability_score
 ```
+
+`metadata_match_score` should include a positive content-sector match and a smaller declared-sector match. A declared-sector conflict is a penalty or warning, not an automatic removal condition.
 
 Then apply penalties:
 
@@ -1184,21 +1335,34 @@ Create a stable key:
 
 ```text
 dedupe_key = SHA256(
-  agent_name +
-  normalized_query +
-  normalized_filters +
+  canonical_query +
+  canonical_filters +
+  canonical_ranking_hints +
+  result_limit +
   as_of_date +
-  index_version
+  corpus_snapshot_hash +
+  retrieval_configuration_version
 )
 ```
 
-If a query is repeated, return the stored result and emit a `SEARCH_DEDUPLICATED` trace event rather than performing the search again.
+Do not include the agent name. Thor and Loki may submit the same retrieval request, and the result should be computed once and reused.
+
+Keep the agent identity in the audit record:
+
+```text
+retrieval_cache_key → shared result
+agent_name          → per-agent SEARCH_CACHE_HIT event
+```
+
+If a query is repeated, return the stored result and emit a `SEARCH_DEDUPLICATED` or `SEARCH_CACHE_HIT` trace event rather than performing the search again. Different as-of dates, corpus snapshots, filters, ranking hints, or retrieval versions must produce different keys.
 
 ---
 
 ## 16. Agent tools and permission boundaries
 
 Every agent receives a narrow tool set.
+
+All billable tools are wrapped by the runtime budget guard. Agents cannot bypass reservation, settlement, or limit checks.
 
 ### Heimdall tools
 
@@ -1208,6 +1372,8 @@ search_evidence(query, filters)
 get_document(doc_id)
 get_trade_rows(filters)
 record_event_verification(result)
+request_budget_reservation(operation, estimated_tokens, estimated_usd)
+settle_budget_reservation(reservation_id, actual_tokens, actual_usd)
 read_private_memory()
 write_private_memory()
 ```
@@ -1263,8 +1429,10 @@ INGESTION_COMPLETED
   ↓
 HEIMDALL_VERIFYING
   ├── EVENT_REJECTED → COMPLETE_WITH_REJECTION
-  └── EVENT_VERIFIED
-          ↓
+   └── EVENT_VERIFIED
+           ↓
+     AS_OF_DATE_GATE
+            ↓
 ROUND_1_STARTED
   ├── THOR_SUBMITTED
   └── LOKI_SUBMITTED
@@ -1276,10 +1444,18 @@ ROUND_2_STARTED
   └── LOKI_DEFENDED_OR_CONCEDED
           ↓
 ODIN_RULING
-          ↓
+           ↓
 SUFFICIENCY_CHECK
   ├── SUFFICIENT → BRIEFING_GENERATION
   └── INSUFFICIENT → RESEARCH_REQUESTED
+                           ↓
+                    RUN_COUNTER_CHECK
+                    ├── limit reached → INCOMPLETE_EVIDENCE
+                    └── budget available
+                           ↓
+                    BUDGET_RESERVATION_CHECK
+                    ├── budget exhausted → INCOMPLETE_BUDGET_LIMIT
+                    └── admitted
                            ↓
                     RUN_2_STARTED
                            ↓
@@ -1301,9 +1477,11 @@ SUFFICIENCY_CHECK
 - No Thor/Loki claims before Heimdall verification.
 - No final briefing before Odin rules on all submitted claims.
 - No second run without an Odin evidence-gap decision.
+- Run 2 must use at least one new evidence family or explicitly record that re-search found no new eligible evidence.
 - No claim without at least one citation.
 - No citation to a future document.
 - No final status if a required stage failed silently.
+- No billable call without a successful global budget reservation.
 
 ### Hard limits
 
@@ -1317,9 +1495,28 @@ max_tool_retries_per_call: 2
 max_wall_clock_seconds: 900
 max_claims_per_side_per_round: 12
 max_tokens_per_agent_call: configured-by-provider
+global_budget_usd: 4.00
+budget_admission_usd: 3.60
+budget_reservation_headroom_usd: 0.40
+global_token_limit: 100000
 ```
 
-If the first run is sufficient, the demo should still support a scripted test mode that deliberately creates an evidence gap so the second-run requirement is visibly demonstrated.
+The dollar budget is shared across the complete case, all runs, all four agents, embeddings, reranking, and retries. The token limit is an independent safety guard.
+
+Before any billable operation is dispatched, the runtime must atomically reserve its conservative maximum cost:
+
+```text
+committed_spend
++ active_reservations
++ proposed_call_max_cost
+≤ budget_admission_usd
+```
+
+After the call, the runtime reconciles the reservation with actual provider usage. Ambiguous timeouts retain their reservation until usage is reconciled. When either the global dollar limit or global token limit is reached, the runtime stops new billable work, persists the incomplete state, and exposes `INCOMPLETE_BUDGET_LIMIT` instead of claiming the case is complete.
+
+The Run 2 demonstration must be driven by an actual Odin evidence-gap decision, not by a scripted trigger. A test fixture may make the gap deterministic, but the production transition must depend on evidence coverage.
+
+If Run 2 produces no new eligible evidence family, the state must be `INCOMPLETE_NO_NEW_EVIDENCE`; the system must not claim that the PS's second-run requirement was satisfied and must publish any unresolved cells as insufficient evidence.
 
 ---
 
@@ -1447,13 +1644,15 @@ Use human-readable inline citations that are also machine-resolvable:
 [ORV-0046, P14, 2027-01-20 10:05]
 ```
 
-For a trade table with explicit rows:
+The source citation format is always based on a real manifest `DOC_ID`, paragraph locator, and manifest publication timestamp. A trade-row database key may be stored internally, but it must not be emitted as a fabricated organizer citation.
 
 ```text
-[TABLE:ORV-0030-trade-note, ROW:5]
+[ORV-0030, P5, 2027-01-21 09:35]
 ```
 
-The UI should render these as links to a source drawer. The API should resolve them to a `DocumentSpan` or `TradeRow` record.
+For a genuine organizer-supplied fixed table that has an official row locator, preserve that row locator internally and render the citation using the document ID plus the table's real paragraph or source locator. Do not invent a `TABLE:` identifier.
+
+The UI should render every citation as a link to a source drawer. The API should resolve the document ID and paragraph/span to a `DocumentSpan`, and may additionally resolve the associated internal `TradeRow`.
 
 ### Citation validation
 
@@ -1461,7 +1660,7 @@ Before briefing publication:
 
 1. Parse every citation.
 2. Confirm the document exists in the manifest.
-3. Confirm the span or row exists.
+3. Confirm the paragraph/span or native row locator exists.
 4. Confirm publication date is on or before the as-of date.
 5. Confirm the cited text supports the paragraph's statement.
 6. Reject or mark the paragraph if any citation fails.
@@ -1537,12 +1736,42 @@ Loki may use a defensible limited-exposure scenario:
 
 Odin should construct the final range from accepted and qualified evidence. It must not simply average Thor and Loki.
 
+### Evidence coverage and unknown values
+
+Before calculating a final cell, Odin evaluates whether the requested country/sector has enough eligible evidence for a defensible numeric range.
+
+For the current E5 pack, Heimdall should explicitly test:
+
+```text
+Tolan / Maize
+Vanir → Midgard / Maize substitution
+Destination-specific rail offsets
+```
+
+If targeted re-search does not find eligible evidence, the system must not turn the missing value into zero exposure or assume a substitute rate from another destination. Store an explicit insufficient-evidence result:
+
+```json
+{
+  "country": "Tolan",
+  "sector": "Maize",
+  "status": "INSUFFICIENT_EVIDENCE",
+  "low": null,
+  "high": null,
+  "reason": "No eligible destination-specific maize trade flow was found by the as-of date.",
+  "searches_performed": ["..."],
+  "new_evidence_found_in_run_2": false
+}
+```
+
+The UI should display this as `Insufficient evidence`, not as a misleading numeric zero. Odin may provide a clearly labeled scenario bound only when the assumptions and supporting evidence justify one.
+
 The Odin calculation record should include:
 
 ```json
 {
   "country": "Midgard",
   "sector": "Wheat",
+  "sector_basis": "content_route_text",
   "metric": "value_shortfall_usd",
   "low": 10000000,
   "high": 35000000,
@@ -1885,6 +2114,7 @@ Reject any output that:
 - Uses a document after the as-of date.
 - Assigns work to another agent.
 - Writes outside its role.
+- Claims a billable tool call occurred without a runtime budget reservation.
 
 ### Secrets
 
@@ -1913,6 +2143,8 @@ The system is large enough for three parallel workstreams, but all three people 
 - Vector search.
 - Hybrid ranking.
 - Citation resolver.
+- Declared-sector versus content-sector conflict detection.
+- Normalized body hashing and evidence-family deduplication.
 
 #### Deliverables
 
@@ -1928,9 +2160,11 @@ scripts/verify_hashes.py
 
 - All three supported file formats ingest.
 - `ORV-0023` does not crash ingestion.
-- `ORV-0007` is decoded with a recorded warning.
+- `ORV-0007` is decoded by independently handling its UTF-8 header and UTF-16 body, with the decoder path recorded.
 - `ORV-0048` is marked truncated.
 - At least two metadata filters work together.
+- Mislabeled maize documents remain retrievable through title/body search.
+- `ORV-0006` and `ORV-0040` share one evidence family.
 - Future documents are excluded.
 - A source span and trade row can be opened by citation.
 
@@ -1947,6 +2181,8 @@ scripts/verify_hashes.py
 - Sufficiency loop.
 - Exposure calculator.
 - Replay engine.
+- Global USD/token budget guard with atomic reservations.
+- Evidence-coverage matrix for genuine Run 2 decisions.
 
 #### Deliverables
 
@@ -1963,10 +2199,11 @@ backend/providers/
 - Thor and Loki each search independently.
 - Round 1 is parallel.
 - Round 2 contains attacks from both sides.
-- At least one claim is rejected, qualified, or conceded.
+- At least one claim is specifically rejected or conceded, satisfying the PS minimum.
 - Odin rules on every submitted claim.
 - Odin can return the case for more evidence.
 - Run 2 contains new evidence.
+- Run 2 is triggered by a real evidence gap, not a scripted branch.
 - Agent private memory changes later behavior.
 
 ### Person 3 — Product, UI, Observability, and QA Engineer
@@ -1980,6 +2217,7 @@ backend/providers/
 - Briefing renderer.
 - Trace viewer.
 - E2E tests.
+- Budget and incomplete-case status visibility.
 - Architecture diagram.
 - README and demo package.
 
@@ -2006,6 +2244,7 @@ docker-compose.yml
 - Citations open source material.
 - Briefing includes outlook and assumptions.
 - Saved logs replay one complete two-run case.
+- If a requested cell lacks evidence, the UI shows `Insufficient evidence` rather than numeric zero.
 
 ---
 
@@ -2123,12 +2362,15 @@ Required cases:
 ```text
 empty document
 malformed UTF-16 document
+mixed UTF-8 header plus UTF-16 body
 truncated document
 missing document
 hash mismatch
 future-dated document
 invalid trade row
 duplicate trade row
+duplicate normalized article body
+declared-sector/content-sector conflict
 prompt-injection text
 empty search result
 provider timeout
@@ -2147,13 +2389,14 @@ Run the E5 question and assert:
 4. Loki searches and submits claims.
 5. Both sides cross-examine.
 6. Odin rules on every claim.
-7. At least one claim is rejected, qualified, or conceded.
-8. Odin returns the case for more evidence at least once in demonstration mode.
-9. Run 2 retrieves a new document set.
+7. At least one claim is specifically rejected or conceded.
+8. Odin returns the case for more evidence because of an observed evidence gap.
+9. Run 2 retrieves at least one new eligible evidence family, or the case is marked `INCOMPLETE_NO_NEW_EVIDENCE`.
 10. The final briefing contains valid citations.
 11. No cited document is after January 25, 2027.
-12. Exposure rows exist for Midgard/Tolan × Wheat/Maize.
+12. Exposure cells exist for Midgard/Tolan × Wheat/Maize, with `Insufficient evidence` where no defensible numeric range exists.
 13. The replay produces the same structured result for the same snapshot.
+14. Total committed and reserved spend never exceeds the configured global budget.
 
 ---
 
@@ -2172,8 +2415,8 @@ Run the E5 question and assert:
 9. Show Thor challenging Loki and Loki challenging Thor.
 10. Show one side defending and one side conceding or narrowing a claim.
 11. Show Odin classifying facts and inferences.
-12. Show Odin returning the case for a second evidence run.
-13. Show new retrieval results in Run 2.
+12. Show Odin returning the case because Tolan-maize or maize-substitution evidence is incomplete.
+13. Show new retrieval results in Run 2 and identify their evidence families.
 14. Show private memory changing a later search or conclusion.
 15. Show the exposure table.
 16. Click an inline citation.
@@ -2211,6 +2454,8 @@ The project is complete when all of the following are true:
 - [ ] Damaged files are quarantined without crashing.
 - [ ] Future documents are filtered.
 - [ ] Prompt-injection text is ignored as a command.
+- [ ] Sector conflicts do not hide relevant title/body evidence.
+- [ ] Duplicate article bodies do not count as independent evidence.
 
 ### Debate
 
@@ -2219,6 +2464,7 @@ The project is complete when all of the following are true:
 - [ ] Round 2 contains real attacks.
 - [ ] Defences or concessions are recorded.
 - [ ] Odin rules on every claim.
+- [ ] At least one claim is rejected or conceded, not merely qualified.
 
 ### Output
 
@@ -2227,6 +2473,7 @@ The project is complete when all of the following are true:
 - [ ] Ranges are labeled by unit and assumptions.
 - [ ] Citations resolve to source spans or trade rows.
 - [ ] Next-quarter outlook is present.
+- [ ] Insufficient evidence is displayed explicitly rather than as zero.
 
 ### Reproducibility
 
@@ -2236,6 +2483,7 @@ The project is complete when all of the following are true:
 - [ ] Agent memory changes are persisted.
 - [ ] Trace is append-only and replayable.
 - [ ] The E5 case can be rerun from the same corpus snapshot.
+- [ ] Global dollar and token budgets are persisted and enforced.
 
 ### Submission
 
@@ -2342,7 +2590,10 @@ Implementation decisions:
 - A future-dated file is still ingestible and visible, but ineligible for the case.
 - A document's extension must not determine reliability.
 - Reliability comes from the source metadata and the outlet guide.
-- Every citation needs a permanent document ID or table-row identity.
+- Every emitted citation uses a real manifest document ID, paragraph locator, and manifest timestamp; internal trade-row keys are never fabricated source IDs.
+- Sector metadata is validated against title, route, and body text rather than used as an unconditional filter.
+- Mixed-encoding files are decoded section-by-section.
+- A normalized body hash prevents duplicate copies from being counted as independent evidence.
 
 The page explicitly warns about prompt-injection-like document text. The source text must be placed in an untrusted evidence envelope and must never be concatenated into an instruction prompt.
 
@@ -2358,7 +2609,7 @@ Page 6 explains how judges score the system:
 | Trap handling | Correction graph, source tiers, clock gate, quarantine flags |
 | Debate quality | Claim-level challenges, new evidence, defences, concessions |
 | Reliability | Timeouts, retries, partial failures, damaged-file handling |
-| Reproducibility | Snapshot hashes, append-only trace, replay mode |
+| Reproducibility | Snapshot hashes, append-only trace, replay mode, persisted budget reservations |
 | Briefing and UI | Dashboard, source click-through, structured briefing renderer |
 
 The architecture is complete only if it produces evidence for each row in this evaluation table.
@@ -2462,6 +2713,8 @@ data/runs/e5-demo/
 ├── final-briefing.md
 ├── final-briefing.json
 ├── exposure-table.csv
+├── evidence-coverage.json
+├── budget-account.json
 └── replay-manifest.json
 ```
 
@@ -2473,6 +2726,8 @@ data/runs/e5-demo/
 - `search-queries.jsonl` proves the agents searched instead of using hard-coded answers.
 - `rulings.json` proves Odin evaluated claims.
 - `trace.jsonl` supports replay and judge inspection.
+- `evidence-coverage.json` shows why Run 2 was requested and which cells remain unknown.
+- `budget-account.json` proves the case stayed within the shared dollar/token limits.
 - Markdown is human-readable.
 - JSON is machine-verifiable.
 - CSV makes the exposure table easy to inspect or import.
